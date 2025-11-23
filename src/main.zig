@@ -10,11 +10,13 @@ const c = @cImport({
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const window: *w.window = try w.createWindow(allocator, 600, 400);
+    const window: *w.window = try w.createWindow(allocator, 603, 402);
     defer allocator.destroy(window);
 
     while (!window.shouldClose) {
-        window.pollEvents();
+        window.pollEvents() catch {
+            break;
+        };
     }
 
     window.destroy();

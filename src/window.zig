@@ -7,6 +7,10 @@ const c = @cImport({
     @cInclude("xdg-shell-protocol.h");
 });
 
+pub const WlDisplayError = error{
+    WlDisplayError,
+};
+
 pub const window = struct {
     width: i32,
     height: i32,
@@ -14,8 +18,14 @@ pub const window = struct {
     registry: *c.struct_wl_registry,
     compositor: ?*c.struct_wl_compositor = null,
     wl_shm: ?*c.struct_wl_shm = null,
+    wl_surface: ?*c.wl_surface = null,
     xdg_wm_base: ?*c.struct_xdg_wm_base = null,
+    xdg_surface: ?*c.xdg_surface = null,
+    poolFd: c_int,
+    poolData: [*]align(4096) u8,
+    poolBufferSize: usize,
     pool: ?*c.struct_wl_shm_pool = null,
+    poolSize: i32,
     buffer: ?*c.wl_buffer = null,
     shouldClose: bool = false,
 
@@ -25,14 +35,63 @@ pub const window = struct {
         c.wl_display_disconnect(self.display);
     }
 
-    pub fn pollEvents(self: *window) void {
-        while (c.wl_display_prepare_read(self.display) != 0) {
-            _ = c.wl_display_dispatch_pending(self.display);
+    pub fn pollEvents(self: *window) !void {
+        if (c.wl_display_dispatch(self.display) == -1) {
+            return WlDisplayError.WlDisplayError;
         }
-        _ = c.wl_display_flush(self.display);
+    }
 
-        _ = c.wl_display_read_events(self.display);
-        _ = c.wl_display_dispatch_pending(self.display);
+    fn resizeBuffer(self: *window, width: i32, height: i32) !void {
+        std.debug.print("Start resize buffer\n", .{});
+        if (width > 0) {} else if (height > 0) {} else {
+            return;
+        }
+
+        c.wl_buffer_destroy(self.buffer);
+
+        const windowSize = width * height * 4;
+        const newPoolSize = windowSize * 2;
+
+        if (self.poolBufferSize < newPoolSize) {
+            const bufAllocationSize = newPoolSize * 2;
+
+            // truncate
+            if (std.c.ftruncate(self.poolFd, bufAllocationSize) != 0) {
+                std.debug.print("Failed to truncate buffer fd", .{});
+                unreachable;
+            }
+
+            // remap
+            const remapFlags: std.posix.MREMAP = .{
+                .MAYMOVE = true,
+            };
+            const newPoolData = try std.posix.mremap(self.poolData, @intCast(self.poolBufferSize), @intCast(bufAllocationSize), remapFlags, null);
+            self.poolData = newPoolData.ptr;
+            self.poolBufferSize = @intCast(bufAllocationSize);
+
+            std.debug.print("Remapped memory from {*} to {*}\n", .{ self.poolData, newPoolData });
+        }
+
+        if (self.poolSize < newPoolSize) {
+            c.wl_shm_pool_resize(self.pool, newPoolSize);
+            self.poolSize = newPoolSize;
+
+            std.debug.print("Resized pool from {}x{} to {}x{}\n", .{ self.width, self.height, width, height });
+        }
+        self.width = width;
+        self.height = height;
+
+        checker_pattern(self.poolData, @intCast(windowSize), @intCast(width * 4));
+
+        const buffer = c.wl_shm_pool_create_buffer(self.pool, 0, width, height, width * 4, c.WL_SHM_FORMAT_ARGB8888);
+        self.buffer = buffer;
+
+        c.xdg_surface_set_window_geometry(self.xdg_surface, 0, 0, width, height);
+
+        c.wl_surface_attach(self.wl_surface, buffer, 0, 0);
+        c.wl_surface_damage(self.wl_surface, 0, 0, width, height);
+        c.wl_surface_commit(self.wl_surface);
+        std.debug.print("End resize buffer\n", .{});
     }
 };
 
@@ -45,6 +104,7 @@ pub fn createWindow(allocator: std.mem.Allocator, width: i32, height: i32) !*win
         std.debug.print("Failed to connect to Wayland display\n", .{});
         unreachable;
     };
+
     state.registry = c.wl_display_get_registry(state.display) orelse {
         std.debug.print("Failed to get Wayland registry\n", .{});
         unreachable;
@@ -63,20 +123,26 @@ pub fn createWindow(allocator: std.mem.Allocator, width: i32, height: i32) !*win
     }
 
     const surface = c.wl_compositor_create_surface(state.compositor);
+    state.wl_surface = surface;
 
     const windowSize = width * height * 4;
-    const bufSize = windowSize * 2;
+    const poolSize = windowSize * 2;
+    const bufAllocationSize = poolSize * 2;
+    state.poolBufferSize = @intCast(bufAllocationSize);
 
-    const poolFd = try shm.get_shm_fd(bufSize);
+    const poolFd = try shm.get_shm_fd(bufAllocationSize);
+    state.poolFd = poolFd;
 
     const mapFlags: std.posix.MAP = .{
         .TYPE = .SHARED,
     };
-    const poolData = try std.posix.mmap(null, @intCast(bufSize), std.posix.PROT.READ | std.posix.PROT.WRITE, mapFlags, poolFd, 0);
-    //@memset(poolData[0..@intCast(bufSize)], 0xFF);
-    checker_pattern(poolData, @intCast(bufSize), @intCast(width * 4));
+    const poolData = try std.posix.mmap(null, @intCast(bufAllocationSize), std.posix.PROT.READ | std.posix.PROT.WRITE, mapFlags, poolFd, 0);
+    state.poolData = @alignCast(poolData.ptr);
+    checker_pattern(poolData.ptr, @intCast(poolSize), @intCast(width * 4));
 
-    state.pool = c.wl_shm_create_pool(state.wl_shm, @intCast(poolFd), windowSize);
+    state.pool = c.wl_shm_create_pool(state.wl_shm, @intCast(poolFd), poolSize);
+    state.poolSize = poolSize;
+
     const buffer = c.wl_shm_pool_create_buffer(state.pool, 0, width, height, width * 4, c.WL_SHM_FORMAT_ARGB8888);
     state.buffer = buffer;
 
@@ -86,6 +152,8 @@ pub fn createWindow(allocator: std.mem.Allocator, width: i32, height: i32) !*win
     _ = c.xdg_wm_base_add_listener(state.xdg_wm_base, &xdg_wm_base_listeners, state);
 
     const xdg_surface = c.xdg_wm_base_get_xdg_surface(state.xdg_wm_base, surface) orelse unreachable;
+    state.xdg_surface = xdg_surface;
+
     const surface_listener = c.struct_xdg_surface_listener{
         .configure = xdg_surface_configure,
     };
@@ -108,9 +176,9 @@ pub fn createWindow(allocator: std.mem.Allocator, width: i32, height: i32) !*win
     return state;
 }
 
-fn checker_pattern(region: []u8, size: usize, stride: usize) void {
-    for (0..(size / stride)) |row| {
-        for (0..(stride / 4)) |column| {
+fn checker_pattern(region: [*]align(4096) u8, size: usize, stride: usize) void {
+    for (0..(size / stride - 1)) |row| {
+        for (0..(stride / 4 - 1)) |column| {
             const checkerSize: usize = 50;
             const rowColor = (row / checkerSize) % 2;
             const pixelColor: u8 = @truncate((column / checkerSize + rowColor) % 2);
@@ -158,11 +226,15 @@ fn toplevel_close(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel) callconv
 }
 
 fn toplevel_configure(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel, width: i32, height: i32, states: ?*c.struct_wl_array) callconv(.c) void {
-    // no-op
-    _ = data;
+    const state: *window = @ptrCast(@alignCast(data));
+
+    if (state.width == width) {} else if (state.height == height) {} else {
+        state.resizeBuffer(width, height) catch {
+            unreachable;
+        };
+    }
+
     _ = toplevel;
-    _ = width;
-    _ = height;
     _ = states;
 }
 
